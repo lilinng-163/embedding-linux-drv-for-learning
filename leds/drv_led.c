@@ -2,8 +2,8 @@
  * @Author: lilinng-163 wangyixiang051129@163.com
  * @Date: 2026-03-22 19:04:48
  * @LastEditors: lilinng-163 wangyixiang051129@163.com
- * @LastEditTime: 2026-03-22 23:14:48
- * @FilePath: \driver\led\drv_led.c
+ * @LastEditTime: 2026-03-23 17:38:13
+ * @FilePath: \driver\leds\drv_led.c
  * @Description: 
  * 
  * Copyright (c) 2026 by wangyixiang@163.com, All Rights Reserved. 
@@ -24,6 +24,13 @@
 #include <linux/device.h>
 #include <asm/io.h>
 
+
+#include "led_opr.h"
+
+#define LED_NUM 2   //LED数量
+
+#define MIN(a, b) (a < b ? a : b)
+
 //寄存器地址,在linux中需要将物理地址映射为虚拟地址
 //IOMUXC_SNVS_SW_MUX_CTL_PAD_SNVS_TAMPER3 addr: 0X02290000 + 0X14
 static volatile unsigned int* IOMUXC_SNVS_SW_MUX_CTL_PAD_SNVS_TAMPER3;
@@ -39,43 +46,37 @@ static volatile unsigned int* GPIO5_DR;
 //主设备号
 static int led_major = 0;
 //类
-static struct class *led_class;
+static struct class* led_class;
+static led_opeartions* led_opr;
 
-static int led_open(struct inode *inode, struct file *filp)
+static int led_open(struct inode *inode, struct file *file)
 {
-    //配置硬件
-    //使能GPIO5,默认使能
-    
-    //配置GPIO5_3为GPIO功能和输出
-    *IOMUXC_SNVS_SW_MUX_CTL_PAD_SNVS_TAMPER3 &= ~0xF;   //清除原来的配置
-    *IOMUXC_SNVS_SW_MUX_CTL_PAD_SNVS_TAMPER3 |= 0x5;    //设置为GPIO功能
-    *GPIO5_GDIR |= (1 << 3);   //设置GPIO5_3为输出
+    //根据次设备号初始化配置硬件
+    int minor = iminor(inode);   //获取次设备号
+
+    printk("%s %s %d\n",__FILE__,__FUNCTION__,__LINE__);
+
+    led_opr->init(minor);
+
     return 0;
 }
-static ssize_t led_write(struct file *filp, const char __user *buf,
-			                size_t count, loff_t *ppos)
+static ssize_t led_read (struct file * file, char __user *buf, size_t size, loff_t *offset)
 {
-    char val;
-    int ret;
+    printk("%s %s %d\n",__FILE__,__FUNCTION__,__LINE__);
+    return 0;
+}
+static ssize_t led_write(struct file *file, const char __user *buf,
+			                size_t size, loff_t *ppos)
+{
+    char status;
     //操作硬件
-    //1、映射虚拟地址   map virtual address(可以在入口函数进行映射)
+    //判断次设备号，根据次设备号控制不同的LED
+    struct inode* inode = file_inode(file);
+    int minor = iminor(inode) & 0x0F;   //获取次设备号
 
-    //2、获取用户空间数据 get data from app
-    ret = copy_from_user(&val,buf,1);  //从用户空间复制数据到内核空间
-    if (ret)
-    {
-        return -EFAULT;
-    }
+    copy_from_user(&status, buf, MIN(1024,size));   //从用户空间获取数据，控制LED状态
 
-    //3、操作硬件   operate hardware
-    if (val == 1)
-    {
-        *GPIO5_DR &= ~(1 << 3);  //GPIO5_3输出低电平，点亮LED
-    }
-    else if (val == 0)
-    {
-        *GPIO5_DR |= (1 << 3);   //GPIO5_3输出高电平，熄灭LED
-    }
+    led_opr->ctrl(minor,status);
 
     return 1;
 }
@@ -83,33 +84,37 @@ static ssize_t led_write(struct file *filp, const char __user *buf,
 static struct file_operations fops = {
     .owner = THIS_MODULE,
     .open = led_open,
+    .read = led_read,
     .write = led_write,
 };
 /*入口函数*/
 static int __init led_init(void)
 {
+    int i;
     printk("%s %s %d\n",__FILE__,__FUNCTION__,__LINE__);
     //注册file_operations结构体
     led_major = register_chrdev(led_major, "led", &fops);
 
-    //映射虚拟地址  ioremap
-    //一参物理地址，二参映射长度(此处为4bytes)
-    IOMUXC_SNVS_SW_MUX_CTL_PAD_SNVS_TAMPER3 = ioremap(0X02290000 + 0X14, 4);
-    GPIO5_GDIR = ioremap(0X020AC000 + 0x4, 4);
-    GPIO5_DR = ioremap(0X020AC000 + 0x0, 4);
     //创建设备节点
     led_class = class_create(THIS_MODULE, "my_led");
-    device_create(led_class, NULL, MKDEV(led_major, 0), NULL, "my_led");
+    for(i = 0;i < LED_NUM; i++)
+    {
+        //设备号由主设备号和次设备号组成，次设备号从0开始递增
+        device_create(led_class, NULL, MKDEV(led_major, i), NULL, "my_led%d",i);    //  /dev/my_led0  /dev/my_led1
+    }
+    //获取LED操作接口
+    led_opr = get_board_led_opr();
 	return 0;
 }
 /*出口函数*/
 static void __exit led_exit(void)
 {
-    iounmap(IOMUXC_SNVS_SW_MUX_CTL_PAD_SNVS_TAMPER3);
-    iounmap(GPIO5_GDIR);
-    iounmap(GPIO5_DR);
+    int i;
     //销毁设备节点
-    device_destroy(led_class, MKDEV(led_major, 0));
+    for(i = 0;i < LED_NUM; i++)
+    {
+        device_destroy(led_class, MKDEV(led_major, i));
+    }
     class_destroy(led_class);
 	//卸载主设备
     //传入主设备号和名字
